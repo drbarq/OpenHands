@@ -78,6 +78,8 @@ class State:
     max_iterations: int = 100
     confirmation_mode: bool = False
     history: list[Event] = field(default_factory=list)
+    _llm = None  # Will be set when initializing with an agent
+    preserve_last_n: int = field(default=10)  # Number of recent messages to preserve without summarization
     inputs: dict = field(default_factory=dict)
     outputs: dict = field(default_factory=dict)
     agent_state: AgentState = AgentState.LOADING
@@ -169,3 +171,134 @@ class State:
             if isinstance(event, MessageAction) and event.source == EventSource.USER:
                 return event
         return None
+
+    def set_llm(self, llm):
+        """Set the LLM instance to use for token management."""
+        self._llm = llm
+
+    def append_event(self, event: Event) -> None:
+        """Append an event to history with token management.
+        
+        This method will:
+        1. Check if adding the event would exceed token limits
+        2. If needed, summarize or truncate older history
+        3. Update the history with the managed version
+        """
+        if not self._llm:
+            # If no LLM is set, just append normally
+            self.history.append(event)
+            return
+
+        # Use token management to get updated history
+        self.history = self.manage_history_tokens(
+            new_message=event,
+            llm=self._llm,
+            max_input_tokens=self._llm.config.max_input_tokens,
+            preserve_last_n=self.preserve_last_n
+        )
+
+    def manage_history_tokens(
+        self, 
+        new_message: Event,
+        llm,
+        max_input_tokens: int | None = None,
+        preserve_last_n: int | None = None
+    ) -> list[Event]:
+        """Manages history to keep token count within limits when adding a new message.
+        
+        Args:
+            new_message: The new event to be added
+            llm: The LLM instance to use for token counting and summarization
+            max_input_tokens: Maximum allowed input tokens. If None, uses llm's config
+            preserve_last_n: Number of most recent messages to preserve without summarization
+            
+        Returns:
+            Updated history list with the new message, potentially truncated or summarized
+        """
+        if max_input_tokens is None:
+            max_input_tokens = llm.config.max_input_tokens or 4096
+
+        if preserve_last_n is None:
+            preserve_last_n = self.preserve_last_n
+
+        # Convert events to messages for token counting
+        messages = []
+        for event in self.history + [new_message]:
+            if isinstance(event, MessageAction):
+                messages.append({
+                    "role": "user" if event.source == EventSource.USER else "assistant",
+                    "content": event.content
+                })
+
+        try:
+            # Get current token count
+            token_count = llm.get_token_count(messages)
+            
+            if token_count <= max_input_tokens:
+                # If within limits, just add the new message
+                return self.history + [new_message]
+
+            # Keep the most recent messages without summarization
+            recent_history = self.history[-preserve_last_n:] if len(self.history) > preserve_last_n else self.history
+            older_history = self.history[:-preserve_last_n] if len(self.history) > preserve_last_n else []
+
+            if not older_history:
+                # If we only have recent history and it's still too long
+                logger.warning("Recent messages alone exceed token limit. Forced to truncate recent history.")
+                return recent_history[-5:] + [new_message]  # Keep last 5 messages as absolute minimum
+
+            # Create a summary of older messages
+            older_messages = []
+            for event in older_history:
+                if isinstance(event, MessageAction):
+                    older_messages.append({
+                        "role": "user" if event.source == EventSource.USER else "assistant",
+                        "content": event.content
+                    })
+
+            summary_prompt = {
+                "role": "user",
+                "content": "Please provide a very concise summary of this conversation, focusing only on the most important points and decisions made:"
+            }
+            
+            try:
+                # Get summary from LLM
+                summary_response = llm.completion(messages=older_messages + [summary_prompt])
+                summary_content = summary_response['choices'][0]['message']['content']
+                
+                # Create a summary event
+                summary_event = MessageAction(
+                    content=f"[HISTORY SUMMARY: {summary_content}]",
+                    source=EventSource.SYSTEM
+                )
+                
+                # Combine summary with recent history and new message
+                updated_history = [summary_event] + recent_history + [new_message]
+                
+                # Verify the new history fits within token limits
+                updated_messages = []
+                for event in updated_history:
+                    if isinstance(event, MessageAction):
+                        updated_messages.append({
+                            "role": "user" if event.source == EventSource.USER else "assistant",
+                            "content": event.content
+                        })
+                
+                final_token_count = llm.get_token_count(updated_messages)
+                if final_token_count <= max_input_tokens:
+                    self.truncation_id = len(self.history) - preserve_last_n
+                    return updated_history
+                
+                # If still too long, fall back to simple truncation
+                logger.warning("Summary still exceeds token limit. Falling back to truncation.")
+                return recent_history[-5:] + [new_message]
+                
+            except Exception as e:
+                logger.error(f"Failed to create history summary: {e}")
+                # Fall back to simple truncation if summarization fails
+                return recent_history + [new_message]
+                
+        except Exception as e:
+            logger.error(f"Error in token management: {e}")
+            # If token counting fails, be conservative and keep only recent history
+            return (self.history[-preserve_last_n:] if len(self.history) > preserve_last_n else self.history) + [new_message]

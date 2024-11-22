@@ -32,8 +32,9 @@ class LLMConfig:
         temperature: The temperature for the API.
         top_p: The top p for the API.
         custom_llm_provider: The custom LLM provider to use. This is undocumented in openhands, and normally not used. It is documented on the litellm side.
-        max_input_tokens: The maximum number of input tokens. Note that this is currently unused, and the value at runtime is actually the total tokens in OpenAI (e.g. 128,000 tokens for GPT-4).
+        max_input_tokens: The maximum number of input tokens. When exceeded, older messages are summarized or truncated based on preserve_last_n setting.
         max_output_tokens: The maximum number of output tokens. This is sent to the LLM.
+        preserve_last_n: Number of recent messages to preserve without summarization when managing token limits. Older messages will be summarized or truncated.
         input_cost_per_token: The cost per input token. This will available in logs for the user to check.
         output_cost_per_token: The cost per output token. This will available in logs for the user to check.
         ollama_base_url: The base URL for the OLLAMA API.
@@ -68,6 +69,7 @@ class LLMConfig:
     custom_llm_provider: str | None = None
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
+    preserve_last_n: int = 10  # Number of recent messages to preserve when managing token limits
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
     ollama_base_url: str | None = None

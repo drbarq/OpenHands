@@ -662,8 +662,15 @@ class AgentController:
         else:
             self.state = state
 
-            if self.state.start_id <= -1:
-                self.state.start_id = 0
+        # Set the LLM instance for token management
+        self.state.set_llm(self.agent.llm)
+        
+        # Set preserve_last_n from config if available
+        if hasattr(self.agent.llm.config, 'preserve_last_n'):
+            self.state.preserve_last_n = self.agent.llm.config.preserve_last_n
+
+        if self.state.start_id <= -1:
+            self.state.start_id = 0
 
             self.log(
                 'debug',

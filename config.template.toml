@@ -126,10 +126,20 @@ embedding_model = "local"
 max_message_chars = 80000
 
 # Maximum number of input tokens (set to prevent TPM limits)
+# This controls the total context window size. When exceeded:
+# 1. Recent messages are preserved (controlled by preserve_last_n)
+# 2. Older messages are summarized using the LLM
+# 3. If summarization fails, falls back to truncation
 max_input_tokens = 20000
 
+# Number of recent messages to preserve without summarization
+# When max_input_tokens is exceeded, this many recent messages
+# will be kept intact, while older messages are summarized
+preserve_last_n = 10
+
 # Maximum number of output tokens (optional)
-#max_output_tokens = 0
+# This limits the length of the LLM's responses
+#max_output_tokens = 4096
 
 # Model to use (Claude 3 Sonnet)
 model = "claude-3-sonnet-20240229"

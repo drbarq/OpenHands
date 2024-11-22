@@ -121,3 +121,19 @@ class FunctionCallNotExistsError(Exception):
 
     def __init__(self, message):
         super().__init__(message)
+
+
+class TokenLimitExceeded(Exception):
+    """Exception raised when the input or output token count exceeds the model's limits.
+    
+    This exception is raised in two scenarios:
+    1. When the input messages exceed the model's maximum context window
+    2. When the estimated output tokens would exceed the model's remaining capacity
+    """
+    
+    def __init__(self, message: str, current_tokens: int | None = None, max_tokens: int | None = None):
+        self.current_tokens = current_tokens
+        self.max_tokens = max_tokens
+        if current_tokens is not None and max_tokens is not None:
+            message = f"{message} (Current: {current_tokens}, Max: {max_tokens})"
+        super().__init__(message)
