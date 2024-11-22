@@ -6,8 +6,10 @@ from functools import partial
 from typing import Any
 
 import requests
+import tiktoken
 
 from openhands.core.config import LLMConfig
+from openhands.core.logger import openhands_logger as logger
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
@@ -108,6 +110,9 @@ class LLM(RetryMixin, DebugMixin):
                 )
             os.makedirs(self.config.log_completions_folder, exist_ok=True)
 
+        # Initialize tokenizer for token counting
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")  # Claude-3's tokenizer
+
         self._completion = partial(
             litellm_completion,
             model=self.config.model,
@@ -179,6 +184,17 @@ class LLM(RetryMixin, DebugMixin):
 
             # ensure we work with a list of messages
             messages = messages if isinstance(messages, list) else [messages]
+
+            # Count total tokens in messages
+            total_tokens = 0
+            for msg in messages:
+                if isinstance(msg.get('content'), str):
+                    total_tokens += len(self.tokenizer.encode(msg['content']))
+
+            # Check against max_input_tokens limit
+            if total_tokens > self.config.max_input_tokens:
+                raise ValueError(f"Input tokens ({total_tokens}) exceed max_input_tokens limit ({self.config.max_input_tokens})")
+
             original_fncall_messages = copy.deepcopy(messages)
             mock_fncall_tools = None
             if mock_function_calling:
@@ -288,6 +304,14 @@ class LLM(RetryMixin, DebugMixin):
         try:
             if self.config.model.startswith('openrouter'):
                 self.model_info = litellm.get_model_info(self.config.model)
+                # OpenRouter returns max_tokens but not max_input_tokens
+                if (
+                    self.model_info 
+                    and 'max_tokens' in self.model_info 
+                    and isinstance(self.model_info['max_tokens'], int)
+                ):
+                    # Set max_input_tokens to 80% of max_tokens to leave room for output
+                    self.config.max_input_tokens = int(self.model_info['max_tokens'] * 0.8)
         except Exception as e:
             logger.debug(f'Error getting model info: {e}')
 
@@ -395,178 +419,42 @@ class LLM(RetryMixin, DebugMixin):
         )
 
     def is_caching_prompt_active(self) -> bool:
-        """Check if prompt caching is supported and enabled for current model.
-
-        Returns:
-            boolean: True if prompt caching is supported and enabled for the given model.
-        """
-        return (
-            self.config.caching_prompt is True
-            and (
-                self.config.model in CACHE_PROMPT_SUPPORTED_MODELS
-                or self.config.model.split('/')[-1] in CACHE_PROMPT_SUPPORTED_MODELS
-            )
-            # We don't need to look-up model_info, because only Anthropic models needs the explicit caching breakpoint
-        )
-
-    def is_function_calling_active(self) -> bool:
-        # Check if model name is in supported list before checking model_info
-        model_name_supported = (
-            self.config.model in FUNCTION_CALLING_SUPPORTED_MODELS
-            or self.config.model.split('/')[-1] in FUNCTION_CALLING_SUPPORTED_MODELS
-            or any(m in self.config.model for m in FUNCTION_CALLING_SUPPORTED_MODELS)
-        )
-        return model_name_supported
-
-    def _post_completion(self, response: ModelResponse) -> None:
-        """Post-process the completion response.
-
-        Logs the cost and usage stats of the completion call.
-        """
-        try:
-            cur_cost = self._completion_cost(response)
-        except Exception:
-            cur_cost = 0
-
-        stats = ''
-        if self.cost_metric_supported:
-            # keep track of the cost
-            stats = 'Cost: %.2f USD | Accumulated Cost: %.2f USD\n' % (
-                cur_cost,
-                self.metrics.accumulated_cost,
-            )
-
-        usage: Usage | None = response.get('usage')
-
-        if usage:
-            # keep track of the input and output tokens
-            input_tokens = usage.get('prompt_tokens')
-            output_tokens = usage.get('completion_tokens')
-
-            if input_tokens:
-                stats += 'Input tokens: ' + str(input_tokens)
-
-            if output_tokens:
-                stats += (
-                    (' | ' if input_tokens else '')
-                    + 'Output tokens: '
-                    + str(output_tokens)
-                    + '\n'
-                )
-
-            # read the prompt cache hit, if any
-            prompt_tokens_details: PromptTokensDetails = usage.get(
-                'prompt_tokens_details'
-            )
-            cache_hit_tokens = (
-                prompt_tokens_details.cached_tokens if prompt_tokens_details else None
-            )
-            if cache_hit_tokens:
-                stats += 'Input tokens (cache hit): ' + str(cache_hit_tokens) + '\n'
-
-            # For Anthropic, the cache writes have a different cost than regular input tokens
-            # but litellm doesn't separate them in the usage stats
-            # so we can read it from the provider-specific extra field
-            model_extra = usage.get('model_extra', {})
-            cache_write_tokens = model_extra.get('cache_creation_input_tokens')
-            if cache_write_tokens:
-                stats += 'Input tokens (cache write): ' + str(cache_write_tokens) + '\n'
-
-        # log the stats
-        if stats:
-            logger.debug(stats)
-
-    def get_token_count(self, messages) -> int:
-        """Get the number of tokens in a list of messages.
-
-        Args:
-            messages (list): A list of messages.
-
-        Returns:
-            int: The number of tokens.
-        """
-        try:
-            return litellm.token_counter(model=self.config.model, messages=messages)
-        except Exception:
-            # TODO: this is to limit logspam in case token count is not supported
-            return 0
-
-    def _is_local(self) -> bool:
-        """Determines if the system is using a locally running LLM.
-
-        Returns:
-            boolean: True if executing a local model.
-        """
-        if self.config.base_url is not None:
-            for substring in ['localhost', '127.0.0.1' '0.0.0.0']:
-                if substring in self.config.base_url:
-                    return True
-        elif self.config.model is not None:
-            if self.config.model.startswith('ollama'):
-                return True
+        """Check if prompt caching is supported and enabled for the current model."""
+        if not self.config.caching_prompt:
+            return False
+        if self.config.model.startswith('claude-3'):
+            model_name = self.config.model.split('/')[-1]
+            return model_name in CACHE_PROMPT_SUPPORTED_MODELS
         return False
 
-    def _completion_cost(self, response) -> float:
-        """Calculate the cost of a completion response based on the model.  Local models are treated as free.
-        Add the current cost into total cost in metrics.
+    def is_function_calling_active(self) -> bool:
+        """Check if function calling is supported for the current model."""
+        if self.config.model.startswith('claude-3'):
+            model_name = self.config.model.split('/')[-1]
+            return model_name in FUNCTION_CALLING_SUPPORTED_MODELS
+        return False
 
-        Args:
-            response: A response from a model invocation.
-
-        Returns:
-            number: The cost of the response.
-        """
-        if not self.cost_metric_supported:
-            return 0.0
-
-        extra_kwargs = {}
-        if (
-            self.config.input_cost_per_token is not None
-            and self.config.output_cost_per_token is not None
-        ):
-            cost_per_token = CostPerToken(
-                input_cost_per_token=self.config.input_cost_per_token,
-                output_cost_per_token=self.config.output_cost_per_token,
-            )
-            logger.debug(f'Using custom cost per token: {cost_per_token}')
-            extra_kwargs['custom_cost_per_token'] = cost_per_token
-
+    def _completion_cost(self, resp: ModelResponse) -> float | None:
+        """Calculate the cost of a completion."""
         try:
-            # try directly get response_cost from response
-            cost = getattr(response, '_hidden_params', {}).get('response_cost', None)
-            if cost is None:
-                cost = litellm_completion_cost(
-                    completion_response=response, **extra_kwargs
-                )
-            self.metrics.add_cost(cost)
+            cost = litellm_completion_cost(
+                completion_response=resp,
+                model=self.config.model,
+                custom_llm_provider=self.config.custom_llm_provider,
+            )
+            if cost is not None:
+                self.metrics.add_cost(cost)
             return cost
-        except Exception:
+        except Exception as e:
+            logger.debug(f'Error calculating completion cost: {e}')
             self.cost_metric_supported = False
-            logger.debug('Cost calculation not supported for this model.')
-        return 0.0
+            return None
 
-    def __str__(self):
-        if self.config.api_version:
-            return f'LLM(model={self.config.model}, api_version={self.config.api_version}, base_url={self.config.base_url})'
-        elif self.config.base_url:
-            return f'LLM(model={self.config.model}, base_url={self.config.base_url})'
-        return f'LLM(model={self.config.model})'
+    def _post_completion(self, resp: ModelResponse):
+        """Post-process a completion response."""
+        if self.cost_metric_supported:
+            self._completion_cost(resp)
 
-    def __repr__(self):
-        return str(self)
-
-    def reset(self) -> None:
-        self.metrics.reset()
-
-    def format_messages_for_llm(self, messages: Message | list[Message]) -> list[dict]:
-        if isinstance(messages, Message):
-            messages = [messages]
-
-        # set flags to know how to serialize the messages
-        for message in messages:
-            message.cache_enabled = self.is_caching_prompt_active()
-            message.vision_enabled = self.vision_is_active()
-            message.function_calling_enabled = self.is_function_calling_active()
-
-        # let pydantic handle the serialization
-        return [message.model_dump() for message in messages]
+    def reset(self):
+        """Reset the LLM instance."""
+        self.metrics = Metrics(model_name=self.metrics.model_name)
