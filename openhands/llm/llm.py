@@ -476,17 +476,28 @@ class LLM(RetryMixin, DebugMixin):
         if stats:
             logger.debug(stats)
 
-    def get_token_count(self, messages) -> int:
-        """Get the number of tokens in a list of messages.
+    def get_token_count(self, messages_or_text) -> int:
+        """Get the number of tokens in messages or text.
 
         Args:
-            messages (list): A list of messages.
+            messages_or_text: A list of messages, a single message, or a string.
 
         Returns:
             int: The number of tokens.
         """
         try:
-            return litellm.token_counter(model=self.config.model, messages=messages)
+            if isinstance(messages_or_text, str):
+                return litellm.token_counter(model=self.config.model, text=messages_or_text)
+            elif isinstance(messages_or_text, (list, dict)):
+                messages = messages_or_text if isinstance(messages_or_text, list) else [messages_or_text]
+                return litellm.token_counter(model=self.config.model, messages=messages)
+            else:
+                raise ValueError(f"Unsupported type for token counting: {type(messages_or_text)}")
+            
+        except Exception as e:
+            logger.error(f"Error counting tokens: {e}")
+            # Return a conservative estimate
+            return self.config.max_input_tokens
         except Exception:
             # TODO: this is to limit logspam in case token count is not supported
             return 0

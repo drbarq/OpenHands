@@ -21,6 +21,7 @@ from openhands.core.exceptions import (
 from openhands.core.logger import LOG_ALL_EVENTS
 from openhands.core.logger import openhands_logger as logger
 from openhands.core.schema import AgentState
+from openhands.core.token_management import TokenManager
 from openhands.events import EventSource, EventStream, EventStreamSubscriber
 from openhands.events.action import (
     Action,
@@ -90,6 +91,8 @@ class AgentController:
         headless_mode: bool = True,
         status_callback: Callable | None = None,
     ):
+        # Initialize token manager first
+        self.token_manager = TokenManager(agent.llm)
         """Initializes a new instance of the AgentController class.
 
         Args:
@@ -223,6 +226,21 @@ class AgentController:
 
         # if the event is not filtered out, add it to the history
         if not any(isinstance(event, filter_type) for filter_type in self.filter_out):
+            # Check if adding this event would exceed token limit
+            temp_history = self.state.history + [event]
+            memory = self.state.memory if hasattr(self.state, 'memory') else None
+            
+            if not self.token_manager.check_token_limit(temp_history, memory):
+                # Need to truncate history if there are too many tokens
+                self.state.history = self._apply_conversation_window(self.state.history)
+                
+                # Double check we're now under limit
+                if not self.token_manager.check_token_limit(self.state.history + [event], memory):
+                    logger.warning(
+                        'Still exceeding token limit after truncation. This may impact agent performance.'
+                    )
+
+            # Now add the new event
             self.state.history.append(event)
 
         if isinstance(event, Action):
